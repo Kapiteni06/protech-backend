@@ -6,6 +6,7 @@ const { OAuth2Client } = require("google-auth-library");
 const { v4: uuidv4 } = require("uuid");
 const fs = require("fs/promises");
 const path = require("path");
+const { readDataset, writeDataset } = require("./database");
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
@@ -60,12 +61,27 @@ function orderId() {
   return `ORD-${Date.now()}-${Math.floor(Math.random() * 9000) + 1000}`;
 }
 
+function datasetKeyFromPath(filePath) {
+  return path.basename(String(filePath || ""), ".json") || "dataset";
+}
+
 async function readJson(filePath, fallback) {
+  const datasetKey = datasetKeyFromPath(filePath);
+
+  const fromDb = await readDataset(datasetKey);
+
+  if (fromDb !== null) {
+    return fromDb;
+  }
+
   try {
     const raw = await fs.readFile(filePath, "utf8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    await writeDataset(datasetKey, parsed);
+    return parsed;
   } catch (error) {
     if (error.code === "ENOENT") {
+      await writeDataset(datasetKey, fallback);
       return fallback;
     }
     throw error;
@@ -73,6 +89,9 @@ async function readJson(filePath, fallback) {
 }
 
 async function writeJson(filePath, value) {
+  const datasetKey = datasetKeyFromPath(filePath);
+  await writeDataset(datasetKey, value);
+
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(filePath, JSON.stringify(value, null, 2) + "\n", "utf8");
 }
