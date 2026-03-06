@@ -362,7 +362,9 @@ app.get("/", (_req, res) => {
     health: "/api/health",
     auth: {
       register: "/api/auth/register",
+      signup: "/api/auth/signup",
       login: "/api/auth/login",
+      signin: "/api/auth/signin",
       google: "/api/auth/google"
     }
   });
@@ -529,7 +531,7 @@ app.post("/api/coupons/validate", (req, res) => {
     });
 });
 
-app.post("/api/auth/register", asyncHandler(async (req, res) => {
+const registerHandler = asyncHandler(async (req, res) => {
   const name = String(req.body?.name || "").trim();
   const email = normalizeEmail(req.body?.email);
   const password = String(req.body?.password || "");
@@ -569,7 +571,10 @@ app.post("/api/auth/register", asyncHandler(async (req, res) => {
 
   const token = signToken(user);
   res.status(201).json({ user: sanitizeUser(user), token });
-}));
+});
+
+app.post("/api/auth/register", registerHandler);
+app.post("/api/auth/signup", registerHandler);
 
 app.post("/api/auth/google", asyncHandler(async (req, res) => {
   const credential = String(req.body?.credential || "").trim();
@@ -640,7 +645,7 @@ app.post("/api/auth/google", asyncHandler(async (req, res) => {
   }
 }));
 
-app.post("/api/auth/login", asyncHandler(async (req, res) => {
+const loginHandler = asyncHandler(async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const password = String(req.body?.password || "");
 
@@ -673,7 +678,10 @@ app.post("/api/auth/login", asyncHandler(async (req, res) => {
 
   const token = signToken(user);
   res.json({ user: sanitizeUser(user), token });
-}));
+});
+
+app.post("/api/auth/login", loginHandler);
+app.post("/api/auth/signin", loginHandler);
 
 app.post("/api/auth/logout", (_req, res) => {
   // JWT logout is handled client-side by discarding the token.
