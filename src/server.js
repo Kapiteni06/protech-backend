@@ -5,6 +5,7 @@ const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 const { OAuth2Client } = require("google-auth-library");
 const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 const fs = require("fs/promises");
 const path = require("path");
 const { readDataset, writeDataset } = require("./database");
@@ -121,6 +122,43 @@ async function sendWelcomeEmail(user) {
   }
 }
 
+function buildPasswordResetToken() {
+  const token = crypto.randomBytes(24).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+
+  return {
+    token,
+    tokenHash,
+    expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString()
+  };
+}
+
+async function sendPasswordResetEmail(user, resetToken) {
+  if (!canSendWelcomeEmail()) {
+    return false;
+  }
+
+  try {
+    const transporter = await getMailTransporter();
+
+    if (!transporter) {
+      return false;
+    }
+
+    await transporter.sendMail({
+      from: EMAIL_FROM,
+      to: user.email,
+      subject: "ProTech password reset",
+      text: `Hi ${user.name || "there"},\n\nUse this reset token to set a new password:\n${resetToken}\n\nThis token expires in 30 minutes.\n\nIf you did not request this, you can ignore this email.`
+    });
+
+    return true;
+  } catch (error) {
+    console.error("Password reset email failed:", error?.message || error);
+    return false;
+  }
+}
+
 function datasetKeyFromPath(filePath) {
   return path.basename(String(filePath || ""), ".json") || "dataset";
 }
@@ -186,7 +224,7 @@ const DEFAULT_PRODUCTS = [
     name: "iPhone 15",
     brand: "Apple",
     category: "phone",
-    price: 15,
+    price: 999,
     description: "Latest Apple smartphone",
     image: "photos/iphone-15-black.jpg"
   },
@@ -794,6 +832,80 @@ const loginHandler = asyncHandler(async (req, res) => {
 app.post("/api/auth/login", loginHandler);
 app.post("/api/auth/signin", loginHandler);
 
+app.post("/api/auth/forgot-password", asyncHandler(async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ message: "Please provide a valid email." });
+  }
+
+  const users = await readUsers();
+  const userIndex = users.findIndex((entry) => normalizeEmail(entry.email) === email);
+
+  if (userIndex === -1 || !users[userIndex].passwordHash) {
+    return res.json({
+      message: "If an account exists for this email, a reset instruction was generated."
+    });
+  }
+
+  const generated = buildPasswordResetToken();
+  users[userIndex].resetPasswordTokenHash = generated.tokenHash;
+  users[userIndex].resetPasswordExpiresAt = generated.expiresAt;
+  await writeUsers(users);
+
+  const emailSent = await sendPasswordResetEmail(users[userIndex], generated.token);
+
+  res.json({
+    message: emailSent
+      ? "Password reset instructions sent to your email."
+      : "Reset token generated. Use it below to set a new password.",
+    // Development fallback when SMTP is not configured.
+    resetToken: emailSent ? undefined : generated.token,
+    expiresInMinutes: 30
+  });
+}));
+
+app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const resetToken = String(req.body?.resetToken || "").trim();
+  const newPassword = String(req.body?.newPassword || "");
+
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ message: "Please provide a valid email." });
+  }
+
+  if (!resetToken) {
+    return res.status(400).json({ message: "Reset token is required." });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({ message: "New password must be at least 6 characters." });
+  }
+
+  const users = await readUsers();
+  const userIndex = users.findIndex((entry) => normalizeEmail(entry.email) === email);
+
+  if (userIndex === -1) {
+    return res.status(400).json({ message: "Invalid email or reset token." });
+  }
+
+  const user = users[userIndex];
+  const tokenHash = crypto.createHash("sha256").update(resetToken).digest("hex");
+  const expiresAt = new Date(user.resetPasswordExpiresAt || 0).getTime();
+  const isExpired = !expiresAt || expiresAt < Date.now();
+
+  if (!user.resetPasswordTokenHash || user.resetPasswordTokenHash !== tokenHash || isExpired) {
+    return res.status(400).json({ message: "Reset token is invalid or expired." });
+  }
+
+  users[userIndex].passwordHash = await bcrypt.hash(newPassword, 10);
+  delete users[userIndex].resetPasswordTokenHash;
+  delete users[userIndex].resetPasswordExpiresAt;
+  await writeUsers(users);
+
+  res.json({ message: "Password reset successfully. You can sign in now." });
+}));
+
 app.post("/api/auth/logout", (_req, res) => {
   // JWT logout is handled client-side by discarding the token.
   res.json({ message: "Signed out successfully." });
@@ -1097,4 +1209,3 @@ app.use((error, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`ProTech backend listening on http://localhost:${PORT}`);
 });
-

@@ -4,7 +4,7 @@
     "name": "iPhone 15",
     "brand": "Apple",
     "category": "phone",
-    "price": 15,
+    "price": 999,
     "description": "Latest Apple smartphone",
     "image": "photos/iphone-15-black.jpg"
   },
@@ -126,4 +126,3 @@
     "image": "https://via.placeholder.com/250x200?text=Mechanical+Keyboard"
   }
 ]
-
