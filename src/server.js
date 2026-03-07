@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const nodemailer = require("nodemailer");
 const { OAuth2Client } = require("google-auth-library");
 const { v4: uuidv4 } = require("uuid");
 const fs = require("fs/promises");
@@ -13,6 +14,12 @@ const PORT = Number(process.env.PORT || 4000);
 const JWT_SECRET = process.env.JWT_SECRET || "dev-insecure-secret-change-me";
 const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 const googleClient = new OAuth2Client();
+const SMTP_HOST = String(process.env.SMTP_HOST || "").trim();
+const SMTP_PORT = Number(process.env.SMTP_PORT || 0);
+const SMTP_USER = String(process.env.SMTP_USER || "").trim();
+const SMTP_PASS = String(process.env.SMTP_PASS || "").trim();
+const SMTP_SECURE = String(process.env.SMTP_SECURE || "").toLowerCase() === "true" || SMTP_PORT === 465;
+const EMAIL_FROM = String(process.env.EMAIL_FROM || SMTP_USER || "").trim();
 
 const DATA_DIR = path.join(__dirname, "..", "data");
 const USERS_FILE = path.join(DATA_DIR, "users.json");
@@ -26,6 +33,7 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "admin@protech.com")
   .map((email) => normalizeEmail(email))
   .filter(Boolean);
 const ORDER_STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled"];
+let mailTransporterPromise = null;
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -59,6 +67,58 @@ function sanitizeUser(user) {
 
 function orderId() {
   return `ORD-${Date.now()}-${Math.floor(Math.random() * 9000) + 1000}`;
+}
+
+function canSendWelcomeEmail() {
+  return Boolean(SMTP_HOST && SMTP_PORT > 0 && SMTP_USER && SMTP_PASS && EMAIL_FROM);
+}
+
+async function getMailTransporter() {
+  if (!canSendWelcomeEmail()) {
+    return null;
+  }
+
+  if (!mailTransporterPromise) {
+    mailTransporterPromise = Promise.resolve(
+      nodemailer.createTransport({
+        host: SMTP_HOST,
+        port: SMTP_PORT,
+        secure: SMTP_SECURE,
+        auth: {
+          user: SMTP_USER,
+          pass: SMTP_PASS
+        }
+      })
+    );
+  }
+
+  return mailTransporterPromise;
+}
+
+async function sendWelcomeEmail(user) {
+  if (!canSendWelcomeEmail()) {
+    return false;
+  }
+
+  try {
+    const transporter = await getMailTransporter();
+
+    if (!transporter) {
+      return false;
+    }
+
+    await transporter.sendMail({
+      from: EMAIL_FROM,
+      to: user.email,
+      subject: "Welcome to ProTech",
+      text: `Hi ${user.name},\n\nYour ProTech account was created successfully.\n\nEmail: ${user.email}\n\nThanks for joining ProTech.`
+    });
+
+    return true;
+  } catch (error) {
+    console.error("Welcome email failed:", error?.message || error);
+    return false;
+  }
 }
 
 function datasetKeyFromPath(filePath) {
@@ -127,7 +187,8 @@ const DEFAULT_PRODUCTS = [
     brand: "Apple",
     category: "phone",
     price: 999,
-    description: "Latest Apple smartphone"
+    description: "Latest Apple smartphone",
+    image: "photos/iphone-15-black.jpg"
   },
   {
     id: "samsung-galaxy-s24",
@@ -135,15 +196,17 @@ const DEFAULT_PRODUCTS = [
     brand: "Samsung",
     category: "phone",
     price: 899,
-    description: "Premium Android phone"
+    description: "Premium Android phone",
+    image: "photos/samsung-galaxy-s24-black.jpg"
   },
   {
-    id: "google-pixel-8",
-    name: "Google Pixel 8",
+    id: "google-pixel-10",
+    name: "Google Pixel 10",
     brand: "Google",
     category: "phone",
     price: 799,
-    description: "Clean Android experience"
+    description: "Clean Android experience",
+    image: "photos/google-pixel-10-frost.jpg"
   },
   {
     id: "xiaomi-14",
@@ -151,7 +214,26 @@ const DEFAULT_PRODUCTS = [
     brand: "Xiaomi",
     category: "phone",
     price: 699,
-    description: "Flagship features at great value"
+    description: "Flagship features at great value",
+    image: "photos/xiaomi-14-jade-green.jpg"
+  },
+  {
+    id: "oneplus-11",
+    name: "OnePlus 11",
+    brand: "OnePlus",
+    category: "phone",
+    price: 749,
+    description: "Fast and smooth performance",
+    image: "photos/oneplus-11-titan-black.jpg"
+  },
+  {
+    id: "samsung-galaxy-s26-ultra",
+    name: "Samsung Galaxy S26 Ultra",
+    brand: "Samsung",
+    category: "phone",
+    price: 1299,
+    description: "Premium camera and performance",
+    image: "photos/samsung-galaxy-s26-sky-blue.jpg"
   },
   {
     id: "macbook-pro-16",
@@ -253,13 +335,16 @@ async function readCoupons() {
 }
 
 function normalizeProduct(product) {
+  const image = String(product?.image || "").trim();
+
   return {
     id: String(product?.id || "").trim(),
     name: String(product?.name || "").trim(),
     brand: String(product?.brand || "").trim(),
     category: String(product?.category || "").trim().toLowerCase(),
     price: Number(product?.price || 0),
-    description: String(product?.description || "").trim()
+    description: String(product?.description || "").trim(),
+    image: image || productImageFallback(product)
   };
 }
 
@@ -277,6 +362,11 @@ function normalizeReview(review) {
 
 function normalizeCouponCode(code) {
   return String(code || "").trim().toUpperCase();
+}
+
+function productImageFallback(product) {
+  const label = encodeURIComponent(String(product?.name || "Product").trim() || "Product");
+  return `https://via.placeholder.com/250x200?text=${label}`;
 }
 
 function isAdminUser(user) {
@@ -588,8 +678,10 @@ const registerHandler = asyncHandler(async (req, res) => {
   users.push(user);
   await writeUsers(users);
 
+  const emailSent = await sendWelcomeEmail(user);
+
   const token = signToken(user);
-  res.status(201).json({ user: sanitizeUser(user), token });
+  res.status(201).json({ user: sanitizeUser(user), token, emailSent });
 });
 
 app.post("/api/auth/register", registerHandler);

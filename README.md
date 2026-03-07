@@ -34,6 +34,12 @@ npm install
 $env:PORT="4000"
 $env:JWT_SECRET="replace-with-a-strong-random-secret"
 $env:GOOGLE_CLIENT_ID="your-google-client-id.apps.googleusercontent.com"
+$env:SMTP_HOST="smtp.example.com"
+$env:SMTP_PORT="587"
+$env:SMTP_USER="no-reply@examlpe.com"
+$env:SMTP_PASS="your-smtp-password"
+$env:SMTP_SECURE="false"
+$env:EMAIL_FROM="ProTech <no-reply@example.com>"
 ```
 
 5. Start backend:
@@ -59,6 +65,7 @@ The API will run at `http://localhost:4000`.
 Auth notes:
 - Register now enforces stricter email format validation.
 - Google login only accepts Google accounts with verified emails.
+- Register/signup can send a welcome email when SMTP env vars are configured.
 
 ### Profile
 - `PUT /api/profile` body: `{ "name": "..." }` (Bearer token)

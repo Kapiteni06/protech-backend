@@ -123,8 +123,10 @@ INSERT INTO users (id, name, email, password_hash, role, auth_provider, created_
 INSERT INTO products (id, name, brand, category, price, description) VALUES
 ('iphone-15', 'iPhone 15', 'Apple', 'phone', 999, 'Latest Apple smartphone'),
 ('samsung-galaxy-s24', 'Samsung Galaxy S24', 'Samsung', 'phone', 899, 'Premium Android phone'),
-('google-pixel-8', 'Google Pixel 8', 'Google', 'phone', 799, 'Clean Android experience'),
+('google-pixel-10', 'Google Pixel 10', 'Google', 'phone', 799, 'Clean Android experience'),
 ('xiaomi-14', 'Xiaomi 14', 'Xiaomi', 'phone', 699, 'Flagship features at great value'),
+('oneplus-11', 'OnePlus 11', 'OnePlus', 'phone', 749, 'Fast and smooth performance'),
+('samsung-galaxy-s26-ultra', 'Samsung Galaxy S26 Ultra', 'Samsung', 'phone', 1299, 'Premium camera and performance'),
 ('macbook-pro-16', 'MacBook Pro 16"', 'Apple', 'laptop', 2499, 'Powerful performance laptop'),
 ('dell-xps-15', 'Dell XPS 15', 'Dell', 'laptop', 1699, 'High-performance ultrabook'),
 ('lenovo-thinkpad-x1', 'Lenovo ThinkPad X1', 'Lenovo', 'laptop', 1499, 'Business-class reliability'),
