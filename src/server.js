@@ -186,7 +186,7 @@ const DEFAULT_PRODUCTS = [
     name: "iPhone 15",
     brand: "Apple",
     category: "phone",
-    price: 999,
+    price: 15,
     description: "Latest Apple smartphone",
     image: "photos/iphone-15-black.jpg"
   },
@@ -1097,3 +1097,4 @@ app.use((error, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`ProTech backend listening on http://localhost:${PORT}`);
 });
+
