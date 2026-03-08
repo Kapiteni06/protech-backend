@@ -10,10 +10,8 @@
     "id": "082fcc84-cf14-411d-8c6e-f8d88bb2975e",
     "name": "Arben",
     "email": "arbendalipi27@gmail.com",
-    "passwordHash": "$2a$10$1AaSllTnOfnJSBQ44HWrr.R2W.vLgfmvTJ2rCCKTREWcTLZBVxpSm",
-    "createdAt": "2026-03-01T20:30:08.257Z",
-    "resetPasswordTokenHash": "a442fca2ceacb91b313f711db2978d764a01fa2970a7ceacb5b02d0fb422febb",
-    "resetPasswordExpiresAt": "2026-03-08T20:19:51.857Z"
+    "passwordHash": "$2a$10$.AmSysj2M8OQRvAIer9mPOywOJ0fKvQXUbbuw7pFP0x.P4GXf4c36",
+    "createdAt": "2026-03-01T20:30:08.257Z"
   },
   {
     "id": "5dd35ef5-3489-4a1e-a3dc-5bb0c1a5f6be",
@@ -27,7 +25,7 @@
     "id": "4a231eda-31c1-4ec2-9b9f-e6c0b5753ff9",
     "name": "beni",
     "email": "beni@gmail.com",
-    "passwordHash": "$2a$10$KpbQeYkjczXgMLAW4ZeO9..OYQlSdb6f6UV04/BKhhsmW.Tzm4Yz6",
+    "passwordHash": "$2a$10$ROj155MMMhbMsZ0ULBydcOyrhvA/l8JgK.N.4tiXExzL0.bGsuFHe",
     "createdAt": "2026-03-01T20:41:58.705Z",
     "role": "admin"
   },

@@ -357,7 +357,16 @@ const DEFAULT_COUPONS = [
 ];
 
 async function readProducts() {
-  return readJson(PRODUCTS_FILE, DEFAULT_PRODUCTS);
+  const products = await readJson(PRODUCTS_FILE, DEFAULT_PRODUCTS);
+
+  if (Array.isArray(products) && products.length > 0) {
+    return products;
+  }
+
+  // Seed defaults if products were initialized as an empty dataset on first deploy.
+  const seededProducts = [...DEFAULT_PRODUCTS];
+  await writeJson(PRODUCTS_FILE, seededProducts);
+  return seededProducts;
 }
 
 async function writeProducts(products) {
