@@ -360,6 +360,10 @@ async function readProducts() {
   return readJson(PRODUCTS_FILE, DEFAULT_PRODUCTS);
 }
 
+async function writeProducts(products) {
+  await writeJson(PRODUCTS_FILE, products);
+}
+
 async function readReviews() {
   return readJson(REVIEWS_FILE, []);
 }
@@ -374,6 +378,8 @@ async function readCoupons() {
 
 function normalizeProduct(product) {
   const image = String(product?.image || "").trim();
+  const parsedStock = Number(product?.stock);
+  const stock = Number.isFinite(parsedStock) ? Math.max(0, Math.floor(parsedStock)) : 1;
 
   return {
     id: String(product?.id || "").trim(),
@@ -381,8 +387,29 @@ function normalizeProduct(product) {
     brand: String(product?.brand || "").trim(),
     category: String(product?.category || "").trim().toLowerCase(),
     price: Number(product?.price || 0),
+    stock,
     description: String(product?.description || "").trim(),
     image: image || productImageFallback(product)
+  };
+}
+
+function slugifyProductId(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function normalizeProductPayload(payload) {
+  const normalized = normalizeProduct(payload || {});
+
+  return {
+    ...normalized,
+    id: slugifyProductId(normalized.id || normalized.name),
+    category: ["phone", "laptop", "others"].includes(normalized.category)
+      ? normalized.category
+      : "others"
   };
 }
 
@@ -1159,6 +1186,174 @@ app.post("/api/orders/:orderId/reorder", authRequired, async (req, res) => {
   await writeOrders(orders);
 
   res.status(201).json({ order: newOrder });
+});
+
+app.get("/api/admin/dashboard", authRequired, adminRequired, async (_req, res) => {
+  const [orders, users, products] = await Promise.all([readOrders(), readUsers(), readProducts()]);
+  const normalizedProducts = products.map(normalizeProduct);
+
+  const totalSales = orders.reduce((sum, order) => sum + Number(order.total || 0), 0);
+  const totalUsers = users.length;
+  const totalOrders = orders.length;
+  const productsInStock = normalizedProducts.reduce(
+    (sum, product) => sum + Math.max(0, Number(product.stock || 0)),
+    0
+  );
+
+  res.json({
+    stats: {
+      totalSales: Number(totalSales.toFixed(2)),
+      totalUsers,
+      totalOrders,
+      productsInStock
+    }
+  });
+});
+
+app.get("/api/admin/products", authRequired, adminRequired, async (_req, res) => {
+  const products = (await readProducts()).map(normalizeProduct);
+  res.json({ products, count: products.length });
+});
+
+app.post("/api/admin/products", authRequired, adminRequired, async (req, res) => {
+  const payload = normalizeProductPayload(req.body);
+
+  if (!payload.id) {
+    return res.status(400).json({ message: "Product id or name is required." });
+  }
+
+  if (!payload.name || !payload.brand) {
+    return res.status(400).json({ message: "Product name and brand are required." });
+  }
+
+  if (!(payload.price > 0)) {
+    return res.status(400).json({ message: "Price must be greater than 0." });
+  }
+
+  const products = (await readProducts()).map(normalizeProduct);
+  const exists = products.some((product) => product.id === payload.id);
+
+  if (exists) {
+    return res.status(409).json({ message: `Product with id ${payload.id} already exists.` });
+  }
+
+  const product = {
+    ...payload,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  products.unshift(product);
+  await writeProducts(products);
+
+  res.status(201).json({ product });
+});
+
+app.put("/api/admin/products/:productId", authRequired, adminRequired, async (req, res) => {
+  const productId = String(req.params.productId || "").trim();
+
+  if (!productId) {
+    return res.status(400).json({ message: "Product id is required." });
+  }
+
+  const products = (await readProducts()).map(normalizeProduct);
+  const productIndex = products.findIndex((product) => product.id === productId);
+
+  if (productIndex === -1) {
+    return res.status(404).json({ message: "Product not found." });
+  }
+
+  const payload = normalizeProductPayload({ ...products[productIndex], ...req.body, id: productId });
+
+  if (!payload.name || !payload.brand) {
+    return res.status(400).json({ message: "Product name and brand are required." });
+  }
+
+  if (!(payload.price > 0)) {
+    return res.status(400).json({ message: "Price must be greater than 0." });
+  }
+
+  products[productIndex] = {
+    ...products[productIndex],
+    ...payload,
+    id: productId,
+    updatedAt: new Date().toISOString()
+  };
+
+  await writeProducts(products);
+  res.json({ product: products[productIndex] });
+});
+
+app.delete("/api/admin/products/:productId", authRequired, adminRequired, async (req, res) => {
+  const productId = String(req.params.productId || "").trim();
+  const products = (await readProducts()).map(normalizeProduct);
+  const nextProducts = products.filter((product) => product.id !== productId);
+
+  if (nextProducts.length === products.length) {
+    return res.status(404).json({ message: "Product not found." });
+  }
+
+  await writeProducts(nextProducts);
+  res.json({ message: `Product ${productId} deleted.` });
+});
+
+app.get("/api/admin/users", authRequired, adminRequired, async (req, res) => {
+  const users = (await readUsers()).map(sanitizeUser);
+  const sorted = users.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+  res.json({
+    users: sorted,
+    count: sorted.length,
+    currentAdminId: req.auth.userId
+  });
+});
+
+app.patch("/api/admin/users/:userId", authRequired, adminRequired, async (req, res) => {
+  const userId = String(req.params.userId || "").trim();
+  const nextRole = String(req.body?.role || "").trim().toLowerCase();
+
+  if (!["admin", "customer"].includes(nextRole)) {
+    return res.status(400).json({ message: "Role must be admin or customer." });
+  }
+
+  const users = await readUsers();
+  const targetIndex = users.findIndex((user) => user.id === userId);
+
+  if (targetIndex === -1) {
+    return res.status(404).json({ message: "User not found." });
+  }
+
+  users[targetIndex].role = nextRole;
+  users[targetIndex].updatedAt = new Date().toISOString();
+  await writeUsers(users);
+
+  res.json({ user: sanitizeUser(users[targetIndex]) });
+});
+
+app.delete("/api/admin/users/:userId", authRequired, adminRequired, async (req, res) => {
+  const userId = String(req.params.userId || "").trim();
+
+  if (userId === req.auth.userId) {
+    return res.status(400).json({ message: "You cannot delete your own admin account." });
+  }
+
+  const users = await readUsers();
+  const targetUser = users.find((user) => user.id === userId);
+
+  if (!targetUser) {
+    return res.status(404).json({ message: "User not found." });
+  }
+
+  const nextUsers = users.filter((user) => user.id !== userId);
+  await writeUsers(nextUsers);
+
+  const carts = await readCarts();
+  if (Object.prototype.hasOwnProperty.call(carts, userId)) {
+    delete carts[userId];
+    await writeCarts(carts);
+  }
+
+  res.json({ message: `User ${targetUser.email} deleted.` });
 });
 
 app.get("/api/admin/orders", authRequired, adminRequired, async (_req, res) => {

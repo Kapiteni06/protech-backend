@@ -11,7 +11,9 @@
     "name": "Arben",
     "email": "arbendalipi27@gmail.com",
     "passwordHash": "$2a$10$1AaSllTnOfnJSBQ44HWrr.R2W.vLgfmvTJ2rCCKTREWcTLZBVxpSm",
-    "createdAt": "2026-03-01T20:30:08.257Z"
+    "createdAt": "2026-03-01T20:30:08.257Z",
+    "resetPasswordTokenHash": "a442fca2ceacb91b313f711db2978d764a01fa2970a7ceacb5b02d0fb422febb",
+    "resetPasswordExpiresAt": "2026-03-08T20:19:51.857Z"
   },
   {
     "id": "5dd35ef5-3489-4a1e-a3dc-5bb0c1a5f6be",
@@ -68,5 +70,23 @@
     "passwordHash": "$2a$10$0Av6VrEY3O5FikJTo/HjXecOTdx8258Ol.njHO10vj4p9AydpLdj2",
     "role": "customer",
     "createdAt": "2026-03-06T20:53:33.396Z"
+  },
+  {
+    "id": "4d8fd438-ebe1-4457-9821-a10e6aa304c8",
+    "name": "Debug Admin",
+    "email": "debug_admin_20260307231316@example.com",
+    "passwordHash": "$2a$10$sjKcuSIWkC5OjaQgIV/5wOCKByb6wBCJLiqiaYLZhYSzzPLVT.782",
+    "role": "admin",
+    "createdAt": "2026-03-07T22:13:16.738Z",
+    "resetPasswordTokenHash": "0996bb4c977c9e7f955beb7d5ba5b41b3363bd0587eb34fabc1ef3e3d9c42a02",
+    "resetPasswordExpiresAt": "2026-03-08T20:18:34.983Z"
+  },
+  {
+    "id": "0c5cd0e6-8f06-4ac5-a4a5-a414cf0bf025",
+    "name": "Debug Admin",
+    "email": "debug_admin_20260307231344@example.com",
+    "passwordHash": "$2a$10$.pKXC.1G5w8P4cNSrlDIBOIFWxzycq7d.ydqn4GdEoNF5FMmH0ep6",
+    "role": "admin",
+    "createdAt": "2026-03-07T22:13:44.138Z"
   }
 ]
