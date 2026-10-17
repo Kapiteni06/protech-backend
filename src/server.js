@@ -12,7 +12,9 @@ const { readDataset, writeDataset } = require("./database");
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
-const JWT_SECRET = process.env.JWT_SECRET || "dev-insecure-secret-change-me";
+const IS_PRODUCTION =
+  String(process.env.NODE_ENV || "").toLowerCase() === "production" || Boolean(process.env.RENDER);
+const JWT_SECRET = resolveJwtSecret();
 const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 const googleClient = new OAuth2Client();
 const SMTP_HOST = String(process.env.SMTP_HOST || "").trim();
@@ -29,21 +31,183 @@ const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
 const PRODUCTS_FILE = path.join(DATA_DIR, "products.json");
 const REVIEWS_FILE = path.join(DATA_DIR, "reviews.json");
 const COUPONS_FILE = path.join(DATA_DIR, "coupons.json");
-const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "admin@protech.com")
+// FIX: no built-in admin email. Admins come only from ADMIN_EMAILS or role "admin" in the database.
+// (Previously anyone could register "admin@protech.com" on a fresh database and become admin.)
+const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
   .split(",")
   .map((email) => normalizeEmail(email))
   .filter(Boolean);
 const ORDER_STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled"];
+const MAX_QUANTITY_PER_ITEM = 99;
+const PLACEHOLDER_IMAGE = "photos/placeholder.svg";
+// FIX: password reset tokens are only returned in the API response when explicitly enabled for local testing.
+const ALLOW_DEV_RESET_TOKEN =
+  !IS_PRODUCTION && String(process.env.ALLOW_DEV_RESET_TOKEN || "").toLowerCase() === "true";
+// Sale prices shown on discounts.html. The server is the source of truth for every price.
+const SALE_PRICES = {
+  "iphone-15": 799,
+  "samsung-galaxy-s26-ultra": 999,
+  "samsung-galaxy-s24": 739,
+  "dell-xps-15": 1329,
+  "asus-rog-zephyrus": 1614,
+  "smart-watch-pro": 224,
+  "mechanical-keyboard": 104
+};
 let mailTransporterPromise = null;
 
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+function resolveJwtSecret() {
+  const configured = String(process.env.JWT_SECRET || "").trim();
+  const isPlaceholder =
+    configured === "change-this-to-a-long-random-string" || configured === "dev-insecure-secret-change-me";
+
+  if (configured && configured.length >= 32 && !isPlaceholder) {
+    return configured;
+  }
+
+  if (IS_PRODUCTION) {
+    // FIX: never fall back to a publicly known secret in production.
+    console.error(
+      "FATAL: JWT_SECRET must be set to a random string of at least 32 characters. Refusing to start."
+    );
+    process.exit(1);
+  }
+
+  console.warn(
+    "WARNING: JWT_SECRET is missing or too short. Using a random secret for this run only " +
+      "(users will be signed out when the server restarts). Set JWT_SECRET to fix this."
+  );
+  return crypto.randomBytes(48).toString("hex");
+}
+
+// FIX: CORS can be limited to your frontend origin(s) with CORS_ORIGINS (comma-separated).
+const CORS_ORIGINS = String(process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
+if (CORS_ORIGINS.length === 0) {
+  console.warn("WARNING: CORS_ORIGINS is not set, so the API accepts requests from any website.");
+}
+
+app.set("trust proxy", 1);
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (CORS_ORIGINS.length === 0 || !origin) {
+        return callback(null, true);
+      }
+
+      const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin) || origin === "null";
+      return callback(null, isLocal || CORS_ORIGINS.includes(origin));
+    }
+  })
+);
+app.use(express.json({ limit: "100kb" }));
+
+// FIX: Express 4 does not catch errors thrown by async route handlers. An unhandled rejection
+// crashes the whole Node process (e.g. changing the password of a Google-only account did this).
+// Every route handler is now wrapped so errors go to the error middleware instead.
+["get", "post", "put", "patch", "delete"].forEach((method) => {
+  const original = app[method].bind(app);
+  app[method] = (routePath, ...handlers) => {
+    if (handlers.length === 0) {
+      return original(routePath);
+    }
+
+    return original(
+      routePath,
+      ...handlers.map((handler) => (typeof handler === "function" ? asyncHandler(handler) : handler))
+    );
+  };
+});
+
+// FIX: all data is stored as whole datasets (read -> modify -> write). Two requests at the same time
+// could overwrite each other's changes. Requests that change data now run one at a time.
+let writeQueue = Promise.resolve();
+
+app.use((req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+    return next();
+  }
+
+  const run = writeQueue.then(
+    () =>
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, 15000);
+        const done = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        res.on("finish", done);
+        res.on("close", done);
+        next();
+      })
+  );
+  writeQueue = run.catch(() => {});
+});
+
+// FIX: simple in-memory rate limiting for login, signup and password reset (no extra package needed).
+function rateLimit({ windowMs, max, message }) {
+  const hits = new Map();
+
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = `${req.ip}|${req.baseUrl}${req.path}`;
+    const entry = hits.get(key);
+
+    if (!entry || entry.resetAt <= now) {
+      hits.set(key, { count: 1, resetAt: now + windowMs });
+    } else {
+      entry.count += 1;
+
+      if (entry.count > max) {
+        res.set("Retry-After", String(Math.ceil((entry.resetAt - now) / 1000)));
+        return res.status(429).json({ message });
+      }
+    }
+
+    if (hits.size > 10000) {
+      for (const [entryKey, value] of hits) {
+        if (value.resetAt <= now) {
+          hits.delete(entryKey);
+        }
+      }
+    }
+
+    next();
+  };
+}
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: "Too many sign-in attempts. Please wait a few minutes and try again."
+});
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: "Too many accounts created from this network. Please try again later."
+});
+const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: "Too many password reset requests. Please wait a few minutes and try again."
+});
+const reviewLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: "Too many reviews. Please try again later."
+});
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
 
 function asyncHandler(handler) {
+  if (handler.length === 4) {
+    return handler;
+  }
+
   return (req, res, next) => {
     Promise.resolve(handler(req, res, next)).catch(next);
   };
@@ -51,6 +215,32 @@ function asyncHandler(handler) {
 
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(email || "").trim());
+}
+
+// FIX: stronger password rule for new passwords (existing users can still sign in).
+function passwordProblem(password) {
+  const value = String(password || "");
+
+  if (value.length < 8) {
+    return "Password must be at least 8 characters.";
+  }
+
+  if (value.length > 128) {
+    return "Password must be at most 128 characters.";
+  }
+
+  if (!/[A-Za-z]/.test(value) || !/\d/.test(value)) {
+    return "Password must contain at least one letter and one number.";
+  }
+
+  return "";
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  error.expose = true;
+  return error;
 }
 
 function sanitizeUser(user) {
@@ -186,12 +376,30 @@ async function readJson(filePath, fallback) {
   }
 }
 
+// FIX: products.json and coupons.json are the source of truth for the catalog, so editing those files
+// now takes effect. Before, the first copy saved in protech.db was used forever and file edits were ignored.
+async function readCatalogFile(filePath, fallback) {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    return JSON.parse(raw);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return fallback;
+    }
+    throw error;
+  }
+}
+
 async function writeJson(filePath, value) {
   const datasetKey = datasetKeyFromPath(filePath);
   await writeDataset(datasetKey, value);
 
+  // The JSON files stay as a mirror (used by scripts/generate-phpmyadmin-sql.js).
+  // FIX: write to a temp file and rename, so a crash mid-write cannot leave a half-written file.
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(value, null, 2) + "\n", "utf8");
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify(value, null, 2) + "\n", "utf8");
+  await fs.rename(tempPath, filePath);
 }
 
 async function readUsers() {
@@ -357,20 +565,63 @@ const DEFAULT_COUPONS = [
 ];
 
 async function readProducts() {
-  const products = await readJson(PRODUCTS_FILE, DEFAULT_PRODUCTS);
-
-  if (Array.isArray(products) && products.length > 0) {
-    return products;
-  }
-
-  // Seed defaults if products were initialized as an empty dataset on first deploy.
-  const seededProducts = [...DEFAULT_PRODUCTS];
-  await writeJson(PRODUCTS_FILE, seededProducts);
-  return seededProducts;
+  return readCatalogFile(PRODUCTS_FILE, DEFAULT_PRODUCTS);
 }
 
-async function writeProducts(products) {
-  await writeJson(PRODUCTS_FILE, products);
+async function readCatalog() {
+  const products = (await readProducts()).map(normalizeProduct);
+  const byId = new Map(products.map((product) => [product.id, product]));
+  const byName = new Map(products.map((product) => [productNameKey(product.name), product]));
+  return { products, byId, byName };
+}
+
+function productNameKey(value) {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+// FIX (price tampering): the browser only says WHICH product and HOW MANY.
+// The price always comes from the catalog. The only prices accepted are the normal
+// price or the advertised sale price; anything else is replaced with the normal price.
+function priceItemsFromCatalog(rawItems, catalog) {
+  if (!Array.isArray(rawItems)) {
+    return [];
+  }
+
+  const merged = new Map();
+
+  rawItems.forEach((item) => {
+    const id = String(item?.productId || item?.id || "").trim();
+    const product = (id && catalog.byId.get(id)) || catalog.byName.get(productNameKey(item?.name));
+
+    if (!product) {
+      throw httpError(400, `Unknown product: ${String(item?.name || id || "").slice(0, 80)}`);
+    }
+
+    const quantity = Math.floor(Number(item?.quantity || 0));
+
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return;
+    }
+
+    const requestedPrice = Number(item?.price);
+    const allowedPrices = [product.price, product.salePrice].filter((price) => Number.isFinite(price));
+    const unitPrice = allowedPrices.includes(requestedPrice) ? requestedPrice : product.price;
+    const key = `${product.id}|${unitPrice}`;
+    const existing = merged.get(key);
+
+    if (existing) {
+      existing.quantity = Math.min(MAX_QUANTITY_PER_ITEM, existing.quantity + quantity);
+    } else {
+      merged.set(key, {
+        productId: product.id,
+        name: product.name,
+        price: unitPrice,
+        quantity: Math.min(MAX_QUANTITY_PER_ITEM, quantity)
+      });
+    }
+  });
+
+  return Array.from(merged.values());
 }
 
 async function readReviews() {
@@ -382,43 +633,28 @@ async function writeReviews(reviews) {
 }
 
 async function readCoupons() {
-  return readJson(COUPONS_FILE, DEFAULT_COUPONS);
+  return readCatalogFile(COUPONS_FILE, DEFAULT_COUPONS);
 }
 
 function normalizeProduct(product) {
-  const image = String(product?.image || "").trim();
-  const parsedStock = Number(product?.stock);
-  const stock = Number.isFinite(parsedStock) ? Math.max(0, Math.floor(parsedStock)) : 1;
+  let image = String(product?.image || "").trim();
+  const id = String(product?.id || "").trim();
+  const salePrice = Number(product?.salePrice ?? SALE_PRICES[id]);
+
+  // FIX: via.placeholder.com no longer works, so those images were broken.
+  if (!image || /via\.placeholder\.com/i.test(image)) {
+    image = productImageFallback(product);
+  }
 
   return {
-    id: String(product?.id || "").trim(),
+    id,
     name: String(product?.name || "").trim(),
     brand: String(product?.brand || "").trim(),
     category: String(product?.category || "").trim().toLowerCase(),
     price: Number(product?.price || 0),
-    stock,
+    salePrice: Number.isFinite(salePrice) && salePrice > 0 ? salePrice : null,
     description: String(product?.description || "").trim(),
-    image: image || productImageFallback(product)
-  };
-}
-
-function slugifyProductId(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-function normalizeProductPayload(payload) {
-  const normalized = normalizeProduct(payload || {});
-
-  return {
-    ...normalized,
-    id: slugifyProductId(normalized.id || normalized.name),
-    category: ["phone", "laptop", "others"].includes(normalized.category)
-      ? normalized.category
-      : "others"
+    image
   };
 }
 
@@ -438,9 +674,8 @@ function normalizeCouponCode(code) {
   return String(code || "").trim().toUpperCase();
 }
 
-function productImageFallback(product) {
-  const label = encodeURIComponent(String(product?.name || "Product").trim() || "Product");
-  return `https://via.placeholder.com/250x200?text=${label}`;
+function productImageFallback(_product) {
+  return PLACEHOLDER_IMAGE;
 }
 
 function isAdminUser(user) {
@@ -558,8 +793,11 @@ app.get("/api/products", async (req, res) => {
   const search = String(req.query.search || "").trim().toLowerCase();
   const category = String(req.query.category || "").trim().toLowerCase();
   const brand = String(req.query.brand || "").trim().toLowerCase();
-  const minPrice = Number(req.query.minPrice || 0);
-  const maxPrice = Number(req.query.maxPrice || Number.POSITIVE_INFINITY);
+  // FIX: an invalid number (e.g. maxPrice=abc) used to become NaN and hide every product.
+  const parsedMin = Number.parseFloat(req.query.minPrice);
+  const parsedMax = Number.parseFloat(req.query.maxPrice);
+  const minPrice = Number.isFinite(parsedMin) ? parsedMin : 0;
+  const maxPrice = Number.isFinite(parsedMax) ? parsedMax : Number.POSITIVE_INFINITY;
   const sort = String(req.query.sort || "").trim().toLowerCase();
 
   const filtered = products.filter((product) => {
@@ -618,17 +856,21 @@ app.get("/api/products/:productId/reviews", async (req, res) => {
   res.json({ reviews, averageRating, count: reviews.length });
 });
 
-app.post("/api/products/:productId/reviews", authRequired, async (req, res) => {
+app.post("/api/products/:productId/reviews", reviewLimiter, authRequired, async (req, res) => {
   const productId = String(req.params.productId || "").trim();
   const rating = Math.floor(Number(req.body?.rating || 0));
   const comment = String(req.body?.comment || "").trim();
 
-  if (rating < 1 || rating > 5) {
+  if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
     return res.status(400).json({ message: "Rating must be between 1 and 5." });
   }
 
   if (comment.length < 3) {
     return res.status(400).json({ message: "Comment must be at least 3 characters." });
+  }
+
+  if (comment.length > 1000) {
+    return res.status(400).json({ message: "Comment must be at most 1000 characters." });
   }
 
   const user = await getCurrentUserById(req.auth.userId);
@@ -723,12 +965,17 @@ const registerHandler = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: "Name must be at least 2 characters." });
   }
 
-  if (!isValidEmail(email)) {
+  if (name.length > 80) {
+    return res.status(400).json({ message: "Name must be at most 80 characters." });
+  }
+
+  if (!isValidEmail(email) || email.length > 254) {
     return res.status(400).json({ message: "Please provide a valid email." });
   }
 
-  if (password.length < 6) {
-    return res.status(400).json({ message: "Password must be at least 6 characters." });
+  const passwordError = passwordProblem(password);
+  if (passwordError) {
+    return res.status(400).json({ message: passwordError });
   }
 
   const users = await readUsers();
@@ -758,10 +1005,10 @@ const registerHandler = asyncHandler(async (req, res) => {
   res.status(201).json({ user: sanitizeUser(user), token, emailSent });
 });
 
-app.post("/api/auth/register", registerHandler);
-app.post("/api/auth/signup", registerHandler);
+app.post("/api/auth/register", registerLimiter, registerHandler);
+app.post("/api/auth/signup", registerLimiter, registerHandler);
 
-app.post("/api/auth/google", asyncHandler(async (req, res) => {
+app.post("/api/auth/google", loginLimiter, asyncHandler(async (req, res) => {
   const credential = String(req.body?.credential || "").trim();
 
   if (!credential) {
@@ -865,11 +1112,14 @@ const loginHandler = asyncHandler(async (req, res) => {
   res.json({ user: sanitizeUser(user), token });
 });
 
-app.post("/api/auth/login", loginHandler);
-app.post("/api/auth/signin", loginHandler);
+app.post("/api/auth/login", loginLimiter, loginHandler);
+app.post("/api/auth/signin", loginLimiter, loginHandler);
 
-app.post("/api/auth/forgot-password", asyncHandler(async (req, res) => {
+app.post("/api/auth/forgot-password", passwordResetLimiter, asyncHandler(async (req, res) => {
   const email = normalizeEmail(req.body?.email);
+  // FIX: same answer whether or not the account exists, so emails cannot be probed.
+  const genericMessage =
+    "If an account exists for this email, password reset instructions have been sent to it.";
 
   if (!isValidEmail(email)) {
     return res.status(400).json({ message: "Please provide a valid email." });
@@ -879,9 +1129,7 @@ app.post("/api/auth/forgot-password", asyncHandler(async (req, res) => {
   const userIndex = users.findIndex((entry) => normalizeEmail(entry.email) === email);
 
   if (userIndex === -1 || !users[userIndex].passwordHash) {
-    return res.json({
-      message: "If an account exists for this email, a reset instruction was generated."
-    });
+    return res.json({ message: genericMessage, expiresInMinutes: 30 });
   }
 
   const generated = buildPasswordResetToken();
@@ -891,17 +1139,21 @@ app.post("/api/auth/forgot-password", asyncHandler(async (req, res) => {
 
   const emailSent = await sendPasswordResetEmail(users[userIndex], generated.token);
 
+  if (!emailSent) {
+    console.warn("Password reset requested but SMTP is not configured, so no email was sent.");
+  }
+
+  // FIX: the reset token is NEVER sent back in the response, because that let anyone who knew an
+  // email address take over the account. Only for local testing, ALLOW_DEV_RESET_TOKEN=true
+  // (ignored in production) brings the old behaviour back.
   res.json({
-    message: emailSent
-      ? "Password reset instructions sent to your email."
-      : "Reset token generated. Use it below to set a new password.",
-    // Development fallback when SMTP is not configured.
-    resetToken: emailSent ? undefined : generated.token,
+    message: genericMessage,
+    resetToken: ALLOW_DEV_RESET_TOKEN && !emailSent ? generated.token : undefined,
     expiresInMinutes: 30
   });
 }));
 
-app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
+app.post("/api/auth/reset-password", passwordResetLimiter, asyncHandler(async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const resetToken = String(req.body?.resetToken || "").trim();
   const newPassword = String(req.body?.newPassword || "");
@@ -914,8 +1166,9 @@ app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
     return res.status(400).json({ message: "Reset token is required." });
   }
 
-  if (newPassword.length < 6) {
-    return res.status(400).json({ message: "New password must be at least 6 characters." });
+  const resetPasswordError = passwordProblem(newPassword);
+  if (resetPasswordError) {
+    return res.status(400).json({ message: resetPasswordError });
   }
 
   const users = await readUsers();
@@ -930,7 +1183,12 @@ app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
   const expiresAt = new Date(user.resetPasswordExpiresAt || 0).getTime();
   const isExpired = !expiresAt || expiresAt < Date.now();
 
-  if (!user.resetPasswordTokenHash || user.resetPasswordTokenHash !== tokenHash || isExpired) {
+  const storedHash = String(user.resetPasswordTokenHash || "");
+  const tokenMatches =
+    storedHash.length === tokenHash.length &&
+    crypto.timingSafeEqual(Buffer.from(storedHash), Buffer.from(tokenHash));
+
+  if (!tokenMatches || isExpired) {
     return res.status(400).json({ message: "Reset token is invalid or expired." });
   }
 
@@ -957,7 +1215,9 @@ app.get("/api/auth/me", authRequired, asyncHandler(async (req, res) => {
   res.json({ user: sanitizeUser(user) });
 }));
 
-app.post("/api/dev/make-admin", async (req, res) => {
+// FIX: this endpoint used to be public, so anyone on the internet could make any account an admin.
+// Now only a signed-in admin can promote another user.
+app.post("/api/dev/make-admin", authRequired, adminRequired, async (req, res) => {
   const email = normalizeEmail(req.body?.email);
 
   if (!isValidEmail(email)) {
@@ -987,6 +1247,10 @@ app.put("/api/profile", authRequired, async (req, res) => {
     return res.status(400).json({ message: "Name must be at least 2 characters." });
   }
 
+  if (nextName.length > 80) {
+    return res.status(400).json({ message: "Name must be at most 80 characters." });
+  }
+
   const users = await readUsers();
   const userIndex = users.findIndex((user) => user.id === req.auth.userId);
 
@@ -1004,8 +1268,9 @@ app.put("/api/profile/password", authRequired, async (req, res) => {
   const currentPassword = String(req.body?.currentPassword || "");
   const newPassword = String(req.body?.newPassword || "");
 
-  if (newPassword.length < 6) {
-    return res.status(400).json({ message: "New password must be at least 6 characters." });
+  const newPasswordError = passwordProblem(newPassword);
+  if (newPasswordError) {
+    return res.status(400).json({ message: newPasswordError });
   }
 
   const users = await readUsers();
@@ -1013,6 +1278,13 @@ app.put("/api/profile/password", authRequired, async (req, res) => {
 
   if (userIndex === -1) {
     return res.status(404).json({ message: "User not found." });
+  }
+
+  // FIX: Google-only accounts have no password; bcrypt threw here and crashed the server.
+  if (!users[userIndex].passwordHash) {
+    return res.status(400).json({
+      message: "This account uses Google Sign-In and has no password to change."
+    });
   }
 
   const passwordOk = await bcrypt.compare(currentPassword, users[userIndex].passwordHash);
@@ -1034,7 +1306,8 @@ app.get("/api/cart", authRequired, async (req, res) => {
 });
 
 app.put("/api/cart", authRequired, async (req, res) => {
-  const items = normalizeCartItems(req.body?.items || []);
+  const catalog = await readCatalog();
+  const items = priceItemsFromCatalog(req.body?.items || [], catalog);
   const carts = await readCarts();
 
   carts[req.auth.userId] = items;
@@ -1045,26 +1318,21 @@ app.put("/api/cart", authRequired, async (req, res) => {
 
 app.post("/api/cart/items", authRequired, async (req, res) => {
   const name = String(req.body?.name || "").trim();
-  const price = Number(req.body?.price || 0);
   const quantity = Math.max(1, Math.floor(Number(req.body?.quantity || 1)));
 
-  if (!name) {
+  if (!name && !req.body?.productId) {
     return res.status(400).json({ message: "Item name is required." });
   }
 
-  if (price < 0) {
-    return res.status(400).json({ message: "Item price cannot be negative." });
-  }
-
+  const catalog = await readCatalog();
   const carts = await readCarts();
-  const currentItems = normalizeCartItems(carts[req.auth.userId] || []);
-  const existing = currentItems.find((item) => item.name === name);
-
-  if (existing) {
-    existing.quantity += quantity;
-  } else {
-    currentItems.push({ name, price, quantity });
-  }
+  const currentItems = priceItemsFromCatalog(
+    [
+      ...normalizeCartItems(carts[req.auth.userId] || []),
+      { productId: req.body?.productId, name, price: req.body?.price, quantity }
+    ],
+    catalog
+  );
 
   carts[req.auth.userId] = currentItems;
   await writeCarts(carts);
@@ -1105,10 +1373,10 @@ app.post("/api/orders", authRequired, async (req, res) => {
     return res.status(404).json({ message: "User not found." });
   }
 
+  const catalog = await readCatalog();
   const carts = await readCarts();
-  const cartItems = normalizeCartItems(carts[req.auth.userId] || []);
-  const requestedItems = normalizeCartItems(req.body?.items || []);
-  const items = requestedItems.length > 0 ? requestedItems : cartItems;
+  const requested = Array.isArray(req.body?.items) && req.body.items.length > 0;
+  const items = priceItemsFromCatalog(requested ? req.body.items : carts[req.auth.userId] || [], catalog);
 
   if (items.length === 0) {
     return res.status(400).json({ message: "Cannot place an order with an empty cart." });
@@ -1133,8 +1401,16 @@ app.post("/api/orders", authRequired, async (req, res) => {
 
   const discount = matchedCoupon ? calculateCouponDiscount(matchedCoupon, subtotal) : 0;
   const total = Math.max(0, subtotal - discount);
-  const delivery = req.body?.delivery || null;
-  const paymentMethod = String(req.body?.paymentMethod || "cash-on-delivery");
+  // FIX: only keep the delivery fields we expect, as short plain strings.
+  const rawDelivery = req.body?.delivery && typeof req.body.delivery === "object" ? req.body.delivery : {};
+  const delivery = {
+    address: String(rawDelivery.address || "").trim().slice(0, 200),
+    city: String(rawDelivery.city || "").trim().slice(0, 100),
+    country: String(rawDelivery.country || "").trim().slice(0, 100)
+  };
+  const allowedPaymentMethods = ["cash-on-delivery", "credit-card", "paypal", "bank-transfer"];
+  const requestedPayment = String(req.body?.paymentMethod || "cash-on-delivery").trim().toLowerCase();
+  const paymentMethod = allowedPaymentMethods.includes(requestedPayment) ? requestedPayment : "cash-on-delivery";
 
   const order = {
     id: orderId(),
@@ -1179,190 +1455,33 @@ app.post("/api/orders/:orderId/reorder", authRequired, async (req, res) => {
     return res.status(404).json({ message: "Order not found." });
   }
 
-  const clonedItems = normalizeCartItems(sourceOrder.items || []);
-  const total = calculateTotal(clonedItems);
+  // FIX: re-ordering now uses today's catalog prices, and no longer copies the old coupon discount
+  // while recalculating the total (the old order said "discount 202" but charged the full price).
+  const catalog = await readCatalog();
+  const clonedItems = priceItemsFromCatalog(sourceOrder.items || [], catalog);
+  const subtotal = calculateTotal(clonedItems);
 
   const newOrder = {
-    ...sourceOrder,
     id: orderId(),
+    userId: sourceOrder.userId,
+    userEmail: sourceOrder.userEmail,
+    userName: sourceOrder.userName,
     createdAt: new Date().toISOString(),
     status: "pending",
     items: clonedItems,
-    total
+    subtotal,
+    discount: 0,
+    total: subtotal,
+    coupon: null,
+    delivery: sourceOrder.delivery || null,
+    paymentMethod: sourceOrder.paymentMethod || "cash-on-delivery",
+    reorderedFrom: sourceOrder.id
   };
 
   orders.unshift(newOrder);
   await writeOrders(orders);
 
   res.status(201).json({ order: newOrder });
-});
-
-app.get("/api/admin/dashboard", authRequired, adminRequired, async (_req, res) => {
-  const [orders, users, products] = await Promise.all([readOrders(), readUsers(), readProducts()]);
-  const normalizedProducts = products.map(normalizeProduct);
-
-  const totalSales = orders.reduce((sum, order) => sum + Number(order.total || 0), 0);
-  const totalUsers = users.length;
-  const totalOrders = orders.length;
-  const productsInStock = normalizedProducts.reduce(
-    (sum, product) => sum + Math.max(0, Number(product.stock || 0)),
-    0
-  );
-
-  res.json({
-    stats: {
-      totalSales: Number(totalSales.toFixed(2)),
-      totalUsers,
-      totalOrders,
-      productsInStock
-    }
-  });
-});
-
-app.get("/api/admin/products", authRequired, adminRequired, async (_req, res) => {
-  const products = (await readProducts()).map(normalizeProduct);
-  res.json({ products, count: products.length });
-});
-
-app.post("/api/admin/products", authRequired, adminRequired, async (req, res) => {
-  const payload = normalizeProductPayload(req.body);
-
-  if (!payload.id) {
-    return res.status(400).json({ message: "Product id or name is required." });
-  }
-
-  if (!payload.name || !payload.brand) {
-    return res.status(400).json({ message: "Product name and brand are required." });
-  }
-
-  if (!(payload.price > 0)) {
-    return res.status(400).json({ message: "Price must be greater than 0." });
-  }
-
-  const products = (await readProducts()).map(normalizeProduct);
-  const exists = products.some((product) => product.id === payload.id);
-
-  if (exists) {
-    return res.status(409).json({ message: `Product with id ${payload.id} already exists.` });
-  }
-
-  const product = {
-    ...payload,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-
-  products.unshift(product);
-  await writeProducts(products);
-
-  res.status(201).json({ product });
-});
-
-app.put("/api/admin/products/:productId", authRequired, adminRequired, async (req, res) => {
-  const productId = String(req.params.productId || "").trim();
-
-  if (!productId) {
-    return res.status(400).json({ message: "Product id is required." });
-  }
-
-  const products = (await readProducts()).map(normalizeProduct);
-  const productIndex = products.findIndex((product) => product.id === productId);
-
-  if (productIndex === -1) {
-    return res.status(404).json({ message: "Product not found." });
-  }
-
-  const payload = normalizeProductPayload({ ...products[productIndex], ...req.body, id: productId });
-
-  if (!payload.name || !payload.brand) {
-    return res.status(400).json({ message: "Product name and brand are required." });
-  }
-
-  if (!(payload.price > 0)) {
-    return res.status(400).json({ message: "Price must be greater than 0." });
-  }
-
-  products[productIndex] = {
-    ...products[productIndex],
-    ...payload,
-    id: productId,
-    updatedAt: new Date().toISOString()
-  };
-
-  await writeProducts(products);
-  res.json({ product: products[productIndex] });
-});
-
-app.delete("/api/admin/products/:productId", authRequired, adminRequired, async (req, res) => {
-  const productId = String(req.params.productId || "").trim();
-  const products = (await readProducts()).map(normalizeProduct);
-  const nextProducts = products.filter((product) => product.id !== productId);
-
-  if (nextProducts.length === products.length) {
-    return res.status(404).json({ message: "Product not found." });
-  }
-
-  await writeProducts(nextProducts);
-  res.json({ message: `Product ${productId} deleted.` });
-});
-
-app.get("/api/admin/users", authRequired, adminRequired, async (req, res) => {
-  const users = (await readUsers()).map(sanitizeUser);
-  const sorted = users.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-
-  res.json({
-    users: sorted,
-    count: sorted.length,
-    currentAdminId: req.auth.userId
-  });
-});
-
-app.patch("/api/admin/users/:userId", authRequired, adminRequired, async (req, res) => {
-  const userId = String(req.params.userId || "").trim();
-  const nextRole = String(req.body?.role || "").trim().toLowerCase();
-
-  if (!["admin", "customer"].includes(nextRole)) {
-    return res.status(400).json({ message: "Role must be admin or customer." });
-  }
-
-  const users = await readUsers();
-  const targetIndex = users.findIndex((user) => user.id === userId);
-
-  if (targetIndex === -1) {
-    return res.status(404).json({ message: "User not found." });
-  }
-
-  users[targetIndex].role = nextRole;
-  users[targetIndex].updatedAt = new Date().toISOString();
-  await writeUsers(users);
-
-  res.json({ user: sanitizeUser(users[targetIndex]) });
-});
-
-app.delete("/api/admin/users/:userId", authRequired, adminRequired, async (req, res) => {
-  const userId = String(req.params.userId || "").trim();
-
-  if (userId === req.auth.userId) {
-    return res.status(400).json({ message: "You cannot delete your own admin account." });
-  }
-
-  const users = await readUsers();
-  const targetUser = users.find((user) => user.id === userId);
-
-  if (!targetUser) {
-    return res.status(404).json({ message: "User not found." });
-  }
-
-  const nextUsers = users.filter((user) => user.id !== userId);
-  await writeUsers(nextUsers);
-
-  const carts = await readCarts();
-  if (Object.prototype.hasOwnProperty.call(carts, userId)) {
-    delete carts[userId];
-    await writeCarts(carts);
-  }
-
-  res.json({ message: `User ${targetUser.email} deleted.` });
 });
 
 app.get("/api/admin/orders", authRequired, adminRequired, async (_req, res) => {
@@ -1406,8 +1525,24 @@ app.use((req, res) => {
 });
 
 app.use((error, _req, res, _next) => {
+  if (error?.type === "entity.parse.failed") {
+    return res.status(400).json({ message: "Request body is not valid JSON." });
+  }
+
+  if (error?.type === "entity.too.large") {
+    return res.status(413).json({ message: "Request body is too large." });
+  }
+
+  if (error?.expose && error.status) {
+    return res.status(error.status).json({ message: error.message });
+  }
+
   console.error(error);
   res.status(500).json({ message: "Internal server error." });
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
 });
 
 app.listen(PORT, () => {
