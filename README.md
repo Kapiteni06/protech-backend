@@ -32,7 +32,9 @@ npm install
 ```bash
 # PowerShell
 $env:PORT="4000"
-$env:JWT_SECRET="replace-with-a-strong-random-secret"
+$env:JWT_SECRET="replace-with-a-random-string-of-at-least-32-characters"
+$env:CORS_ORIGINS="https://your-frontend.example.com"
+$env:ADMIN_EMAILS="you@example.com"
 $env:GOOGLE_CLIENT_ID="your-google-client-id.apps.googleusercontent.com"
 $env:SMTP_HOST="smtp.example.com"
 $env:SMTP_PORT="587"
@@ -83,8 +85,8 @@ Auth notes:
 - `POST /api/orders` body: `{ "delivery": {...}, "paymentMethod": "cash-on-delivery" }` (or include `items`) (Bearer token)
 - `POST /api/orders/:orderId/reorder` (Bearer token)
 
-### Dev
-- `POST /api/dev/make-admin` body: `{ "email": "..." }`
+### Admin
+- `POST /api/dev/make-admin` body: `{ "email": "..." }` (Bearer token of an existing **admin** — no longer public)
 
 ## Frontend integration notes
 
@@ -122,21 +124,31 @@ localStorage.setItem("protechApiBaseUrl", "https://your-backend-service.onrender
 2. Build command: `npm install`
 3. Start command: `npm start`
 4. Required env vars:
-	- `JWT_SECRET` = strong random secret
+	- `JWT_SECRET` = random string, at least 32 characters (the server will not start on Render without it)
+	- `SMTP_*` + `EMAIL_FROM` if you want password reset to work (the reset token is only ever sent by email)
 5. Optional env vars:
 	- `PORT` (Render provides this automatically)
 	- `GOOGLE_CLIENT_ID` (if you use Google login)
-	- `ADMIN_EMAILS` (comma-separated admin emails)
+	- `ADMIN_EMAILS` (comma-separated admin emails; there is no built-in admin email any more)
+	- `CORS_ORIGINS` (comma-separated frontend URLs allowed to call the API)
 6. Keep frontend requests pointed to the backend using `window.PROTECH_API_BASE_URL` for split deployments.
 
 Auth smoke test commands:
 
 ```powershell
 $email = "render_test_$(Get-Date -Format 'yyyyMMddHHmmss')@example.com"
-$regBody = @{ name = 'Render Test'; email = $email; password = 'secret123' } | ConvertTo-Json
+$regBody = @{ name = 'Render Test'; email = $email; password = 'secret1234' } | ConvertTo-Json
 $register = Invoke-RestMethod -Method Post -Uri 'http://localhost:4000/api/auth/register' -ContentType 'application/json' -Body $regBody
-$loginBody = @{ email = $email; password = 'secret123' } | ConvertTo-Json
+$loginBody = @{ email = $email; password = 'secret1234' } | ConvertTo-Json
 $login = Invoke-RestMethod -Method Post -Uri 'http://localhost:4000/api/auth/login' -ContentType 'application/json' -Body $loginBody
 $me = Invoke-RestMethod -Method Get -Uri 'http://localhost:4000/api/auth/me' -Headers @{ Authorization = "Bearer $($login.token)" }
 ```
  
+## Security notes (October 2026 fixes)
+
+- Prices are always taken from `data/products.json` on the server; the browser only sends which product and how many. Sale prices for the Discounts page live in `SALE_PRICES` in `src/server.js`.
+- `data/products.json` and `data/coupons.json` are read directly, so editing them takes effect.
+- Passwords for new accounts / resets must be 8+ characters with a letter and a number.
+- Sign-in, sign-up, password reset and reviews are rate-limited per IP.
+- Requests that change data run one at a time, so simultaneous requests no longer overwrite each other.
+- `ALLOW_DEV_RESET_TOKEN=true` returns the reset token in the API response for local testing only; it is ignored in production.
