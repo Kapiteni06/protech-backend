@@ -37,6 +37,16 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
   .split(",")
   .map((email) => normalizeEmail(email))
   .filter(Boolean);
+// Super admins can do everything, including managing other admins. Set SUPER_ADMIN_EMAILS on the server
+// (comma-separated) so at least one super admin always exists, even if the data is reset.
+const SUPER_ADMIN_EMAILS = String(process.env.SUPER_ADMIN_EMAILS || "")
+  .split(",")
+  .map((email) => normalizeEmail(email))
+  .filter(Boolean);
+// What an admin can be allowed to do. A "full" admin has all of these; a "limited" admin has some.
+const ADMIN_PERMISSIONS = ["orders.view", "orders.update", "customers.view"];
+// Only super admins can add, change or remove admins.
+const TEAM_PERMISSION = "team.manage";
 const ORDER_STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled"];
 const MAX_QUANTITY_PER_ITEM = 99;
 const PLACEHOLDER_IMAGE = "photos/placeholder.svg";
@@ -243,16 +253,61 @@ function httpError(status, message) {
   return error;
 }
 
+// Works out what a user may do. Server settings (SUPER_ADMIN_EMAILS / ADMIN_EMAILS) win over
+// what is stored, and are "locked" so they can't be removed from the admin panel.
+function accessFor(user) {
+  if (!user) {
+    return { role: "customer", permissions: [], locked: false };
+  }
+
+  const email = normalizeEmail(user.email);
+
+  if (SUPER_ADMIN_EMAILS.includes(email)) {
+    return { role: "superadmin", permissions: [...ADMIN_PERMISSIONS, TEAM_PERMISSION], locked: true };
+  }
+
+  if (user.role === "superadmin") {
+    return { role: "superadmin", permissions: [...ADMIN_PERMISSIONS, TEAM_PERMISSION], locked: false };
+  }
+
+  if (ADMIN_EMAILS.includes(email)) {
+    return { role: "admin", permissions: [...ADMIN_PERMISSIONS], locked: true };
+  }
+
+  if (user.role === "admin") {
+    // Admins created before permissions existed keep full access.
+    const permissions = Array.isArray(user.permissions)
+      ? ADMIN_PERMISSIONS.filter((permission) => user.permissions.includes(permission))
+      : [...ADMIN_PERMISSIONS];
+    return { role: "admin", permissions, locked: false };
+  }
+
+  return { role: "customer", permissions: [], locked: false };
+}
+
+function accessLevel(access) {
+  if (access.role === "superadmin") {
+    return "super";
+  }
+  if (access.role === "admin") {
+    return access.permissions.length === ADMIN_PERMISSIONS.length ? "full" : "limited";
+  }
+  return "none";
+}
+
 function sanitizeUser(user) {
-  const role = user.role || "customer";
+  const access = accessFor(user);
 
   return {
     id: user.id,
     name: user.name,
     email: user.email,
     createdAt: user.createdAt,
-    role,
-    isAdmin: role === "admin" || ADMIN_EMAILS.includes(normalizeEmail(user.email))
+    role: access.role,
+    isAdmin: access.role !== "customer",
+    isSuperAdmin: access.role === "superadmin",
+    permissions: access.permissions,
+    accessLevel: accessLevel(access)
   };
 }
 
@@ -679,7 +734,7 @@ function productImageFallback(_product) {
 }
 
 function isAdminUser(user) {
-  return Boolean(user && (user.role === "admin" || ADMIN_EMAILS.includes(normalizeEmail(user.email))));
+  return accessFor(user).role !== "customer";
 }
 
 function calculateCouponDiscount(coupon, subtotal) {
@@ -740,7 +795,28 @@ async function adminRequired(req, res, next) {
   }
 
   req.admin = user;
+  req.access = accessFor(user);
   next();
+}
+
+// Checked against the stored user on every request, so access changes apply immediately.
+function requirePermission(...anyOf) {
+  return async (req, res, next) => {
+    const user = await getCurrentUserById(req.auth.userId);
+    const access = accessFor(user);
+
+    if (access.role === "customer") {
+      return res.status(403).json({ message: "Admin access required." });
+    }
+
+    if (!anyOf.some((permission) => access.permissions.includes(permission))) {
+      return res.status(403).json({ message: "Your admin account doesn't have permission to do this." });
+    }
+
+    req.admin = user;
+    req.access = access;
+    next();
+  };
 }
 
 function normalizeCartItems(items) {
@@ -986,13 +1062,12 @@ const registerHandler = asyncHandler(async (req, res) => {
   }
 
   const passwordHash = await bcrypt.hash(password, 10);
-  const isAdmin = ADMIN_EMAILS.includes(email);
   const user = {
     id: uuidv4(),
     name,
     email,
     passwordHash,
-    role: isAdmin ? "admin" : "customer",
+    role: "customer",
     createdAt: new Date().toISOString()
   };
 
@@ -1042,15 +1117,13 @@ app.post("/api/auth/google", loginLimiter, asyncHandler(async (req, res) => {
 
     const users = await readUsers();
     const existingIndex = users.findIndex((user) => normalizeEmail(user.email) === email);
-    const isAdmin = ADMIN_EMAILS.includes(email);
-
     if (existingIndex === -1) {
       const newUser = {
         id: uuidv4(),
         name: name.length >= 2 ? name : "Google User",
         email,
         authProvider: "google",
-        role: isAdmin ? "admin" : "customer",
+        role: "customer",
         createdAt: new Date().toISOString()
       };
 
@@ -1065,7 +1138,7 @@ app.post("/api/auth/google", loginLimiter, asyncHandler(async (req, res) => {
     users[existingIndex] = {
       ...existingUser,
       authProvider: existingUser.authProvider || "google",
-      role: isAdmin ? "admin" : existingUser.role || "customer"
+      role: existingUser.role || "customer"
     };
 
     await writeUsers(users);
@@ -1216,8 +1289,8 @@ app.get("/api/auth/me", authRequired, asyncHandler(async (req, res) => {
 }));
 
 // FIX: this endpoint used to be public, so anyone on the internet could make any account an admin.
-// Now only a signed-in admin can promote another user.
-app.post("/api/dev/make-admin", authRequired, adminRequired, async (req, res) => {
+// Now only a super admin can use it (the admin panel's Team tab is the normal way to do this).
+app.post("/api/dev/make-admin", authRequired, requirePermission(TEAM_PERMISSION), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
 
   if (!isValidEmail(email)) {
@@ -1231,11 +1304,16 @@ app.post("/api/dev/make-admin", authRequired, adminRequired, async (req, res) =>
     return res.status(404).json({ message: "User not found." });
   }
 
+  if (users[userIndex].id === req.admin.id) {
+    return res.status(400).json({ message: "You can't change your own access." });
+  }
+
   users[userIndex].role = "admin";
+  users[userIndex].permissions = [...ADMIN_PERMISSIONS];
   await writeUsers(users);
 
   res.json({
-    message: `User ${email} is now admin. Please sign out and sign in again.`,
+    message: `User ${email} is now admin.`,
     user: sanitizeUser(users[userIndex])
   });
 });
@@ -1484,7 +1562,7 @@ app.post("/api/orders/:orderId/reorder", authRequired, async (req, res) => {
   res.status(201).json({ order: newOrder });
 });
 
-app.get("/api/admin/orders", authRequired, adminRequired, async (_req, res) => {
+app.get("/api/admin/orders", authRequired, requirePermission("orders.view"), async (_req, res) => {
   const orders = (await readOrders()).map((order) => ({
     ...order,
     status: String(order.status || "pending").toLowerCase()
@@ -1492,7 +1570,7 @@ app.get("/api/admin/orders", authRequired, adminRequired, async (_req, res) => {
   res.json({ orders, count: orders.length });
 });
 
-app.patch("/api/admin/orders/:orderId/status", authRequired, adminRequired, async (req, res) => {
+app.patch("/api/admin/orders/:orderId/status", authRequired, requirePermission("orders.update"), async (req, res) => {
   const orderIdParam = String(req.params.orderId || "").trim();
   const nextStatus = String(req.body?.status || "").trim().toLowerCase();
 
@@ -1518,6 +1596,106 @@ app.patch("/api/admin/orders/:orderId/status", authRequired, adminRequired, asyn
 
   await writeOrders(orders);
   res.json({ order: orders[orderIndex] });
+});
+
+// ---------- Customers and team (admin panel) ----------
+
+function teamMember(user, orders) {
+  const access = accessFor(user);
+  const own = orders.filter((order) => order.userId === user.id);
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    createdAt: user.createdAt,
+    role: access.role,
+    accessLevel: accessLevel(access),
+    permissions: access.permissions,
+    locked: access.locked,
+    orderCount: own.length,
+    totalSpent: own.reduce((sum, order) => sum + Number(order.total || 0), 0),
+    accessUpdatedAt: user.accessUpdatedAt || null,
+    accessUpdatedBy: user.accessUpdatedBy || null
+  };
+}
+
+app.get("/api/admin/users", authRequired, requirePermission("customers.view", TEAM_PERMISSION), async (_req, res) => {
+  const [users, orders] = await Promise.all([readUsers(), readOrders()]);
+  const list = users.map((user) => teamMember(user, orders));
+  res.json({ users: list, count: list.length, permissions: ADMIN_PERMISSIONS });
+});
+
+function parseAccessChange(body) {
+  const level = String(body?.accessLevel || "").trim().toLowerCase();
+
+  if (level === "none") {
+    return { role: "customer", permissions: [] };
+  }
+  if (level === "super") {
+    return { role: "superadmin", permissions: [] };
+  }
+  if (level === "full") {
+    return { role: "admin", permissions: [...ADMIN_PERMISSIONS] };
+  }
+  if (level === "limited") {
+    const requested = Array.isArray(body?.permissions) ? body.permissions.map(String) : [];
+    const permissions = ADMIN_PERMISSIONS.filter((permission) => requested.includes(permission));
+    if (permissions.length === 0) {
+      throw httpError(400, "Choose at least one permission for a limited admin.");
+    }
+    return { role: "admin", permissions };
+  }
+  throw httpError(400, "Access level must be one of: none, limited, full, super.");
+}
+
+async function changeAccess(req, res, findUser) {
+  const change = parseAccessChange(req.body);
+  const [users, orders] = await Promise.all([readUsers(), readOrders()]);
+  const index = users.findIndex(findUser);
+
+  if (index === -1) {
+    return res.status(404).json({
+      message: "No account found. The person needs to create an account on the shop first."
+    });
+  }
+
+  const target = users[index];
+
+  if (target.id === req.admin.id) {
+    return res.status(400).json({ message: "You can't change your own access." });
+  }
+
+  if (accessFor(target).locked) {
+    return res.status(400).json({
+      message: "This person's access is set in the server settings (SUPER_ADMIN_EMAILS or ADMIN_EMAILS) and can't be changed here."
+    });
+  }
+
+  users[index] = {
+    ...target,
+    role: change.role,
+    permissions: change.role === "admin" ? change.permissions : [],
+    accessUpdatedAt: new Date().toISOString(),
+    accessUpdatedBy: req.admin.email
+  };
+
+  await writeUsers(users);
+  res.json({ user: teamMember(users[index], orders) });
+}
+
+// Add or change an admin by email (Team tab "Add admin")
+app.post("/api/admin/team", authRequired, requirePermission(TEAM_PERMISSION), async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ message: "Please provide a valid email." });
+  }
+  return changeAccess(req, res, (user) => normalizeEmail(user.email) === email);
+});
+
+// Change or remove an existing admin
+app.patch("/api/admin/team/:userId", authRequired, requirePermission(TEAM_PERMISSION), async (req, res) => {
+  const userId = String(req.params.userId || "").trim();
+  return changeAccess(req, res, (user) => user.id === userId);
 });
 
 app.use((req, res) => {
