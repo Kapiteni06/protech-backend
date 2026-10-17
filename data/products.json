@@ -60,7 +60,7 @@
     "category": "laptop",
     "price": 2499,
     "description": "Powerful performance laptop",
-    "image": "https://via.placeholder.com/250x200?text=MacBook+Pro+16"
+    "image": "photos/placeholder.svg"
   },
   {
     "id": "dell-xps-15",
@@ -69,7 +69,7 @@
     "category": "laptop",
     "price": 1699,
     "description": "High-performance ultrabook",
-    "image": "https://via.placeholder.com/250x200?text=Dell+XPS+15"
+    "image": "photos/placeholder.svg"
   },
   {
     "id": "lenovo-thinkpad-x1",
@@ -78,7 +78,7 @@
     "category": "laptop",
     "price": 1499,
     "description": "Business-class reliability",
-    "image": "https://via.placeholder.com/250x200?text=Lenovo+ThinkPad+X1"
+    "image": "photos/placeholder.svg"
   },
   {
     "id": "asus-rog-zephyrus",
@@ -87,7 +87,7 @@
     "category": "laptop",
     "price": 1899,
     "description": "Portable gaming powerhouse",
-    "image": "https://via.placeholder.com/250x200?text=ASUS+ROG+Zephyrus"
+    "image": "photos/placeholder.svg"
   },
   {
     "id": "gaming-pc-rtx-4090",
@@ -96,7 +96,7 @@
     "category": "others",
     "price": 3299,
     "description": "Ultimate gaming machine",
-    "image": "https://via.placeholder.com/250x200?text=Gaming+PC+RTX+4090"
+    "image": "photos/placeholder.svg"
   },
   {
     "id": "smart-watch-pro",
@@ -105,7 +105,7 @@
     "category": "others",
     "price": 299,
     "description": "Fitness and notifications on your wrist",
-    "image": "https://via.placeholder.com/250x200?text=Smart+Watch+Pro"
+    "image": "photos/placeholder.svg"
   },
   {
     "id": "wireless-headphones",
@@ -114,7 +114,7 @@
     "category": "others",
     "price": 249,
     "description": "Noise cancellation and rich sound",
-    "image": "https://via.placeholder.com/250x200?text=Wireless+Headphones"
+    "image": "photos/placeholder.svg"
   },
   {
     "id": "mechanical-keyboard",
@@ -123,6 +123,6 @@
     "category": "others",
     "price": 149,
     "description": "Fast response with tactile switches",
-    "image": "https://via.placeholder.com/250x200?text=Mechanical+Keyboard"
+    "image": "photos/placeholder.svg"
   }
 ]
