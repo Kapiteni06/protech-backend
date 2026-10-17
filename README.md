@@ -129,7 +129,8 @@ localStorage.setItem("protechApiBaseUrl", "https://your-backend-service.onrender
 5. Optional env vars:
 	- `PORT` (Render provides this automatically)
 	- `GOOGLE_CLIENT_ID` (if you use Google login)
-	- `ADMIN_EMAILS` (comma-separated admin emails; there is no built-in admin email any more)
+	- `SUPER_ADMIN_EMAILS` (comma-separated; super admins can add, change and remove admins from the admin panel)
+	- `ADMIN_EMAILS` (comma-separated full admins; there is no built-in admin email any more)
 	- `CORS_ORIGINS` (comma-separated frontend URLs allowed to call the API)
 6. Keep frontend requests pointed to the backend using `window.PROTECH_API_BASE_URL` for split deployments.
 
@@ -152,3 +153,17 @@ $me = Invoke-RestMethod -Method Get -Uri 'http://localhost:4000/api/auth/me' -He
 - Sign-in, sign-up, password reset and reviews are rate-limited per IP.
 - Requests that change data run one at a time, so simultaneous requests no longer overwrite each other.
 - `ALLOW_DEV_RESET_TOKEN=true` returns the reset token in the API response for local testing only; it is ignored in production.
+
+## Admin roles
+
+| Level | Can do |
+|---|---|
+| Super admin | Everything, including adding, changing and removing admins (Team tab) |
+| Full access | View orders, change order status, view customers |
+| Limited access | Only the permissions the super admin ticks: view orders, change order status, view customers |
+
+- Super admins come from `SUPER_ADMIN_EMAILS`, or are promoted by another super admin.
+- People listed in `SUPER_ADMIN_EMAILS` / `ADMIN_EMAILS` show as "Set on server" and can't be changed from the panel.
+- Nobody can change their own access. Changes apply immediately (no need to sign in again).
+- API: `GET /api/admin/users`, `POST /api/admin/team` `{ email, accessLevel, permissions }`, `PATCH /api/admin/team/:userId` `{ accessLevel, permissions }`.
+  `accessLevel` is `none`, `limited`, `full` or `super`; `permissions` (for limited) is any of `orders.view`, `orders.update`, `customers.view`.
