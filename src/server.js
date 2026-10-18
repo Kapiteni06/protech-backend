@@ -2,13 +2,13 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const nodemailer = require("nodemailer");
 const { OAuth2Client } = require("google-auth-library");
 const { v4: uuidv4 } = require("uuid");
 const crypto = require("crypto");
 const fs = require("fs/promises");
 const path = require("path");
-const { readDataset, writeDataset } = require("./database");
+const store = require("./store");
+const mailer = require("./mailer");
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
@@ -17,19 +17,9 @@ const IS_PRODUCTION =
 const JWT_SECRET = resolveJwtSecret();
 const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 const googleClient = new OAuth2Client();
-const SMTP_HOST = String(process.env.SMTP_HOST || "").trim();
-const SMTP_PORT = Number(process.env.SMTP_PORT || 0);
-const SMTP_USER = String(process.env.SMTP_USER || "").trim();
-const SMTP_PASS = String(process.env.SMTP_PASS || "").trim();
-const SMTP_SECURE = String(process.env.SMTP_SECURE || "").toLowerCase() === "true" || SMTP_PORT === 465;
-const EMAIL_FROM = String(process.env.EMAIL_FROM || SMTP_USER || "").trim();
 
 const DATA_DIR = path.join(__dirname, "..", "data");
-const USERS_FILE = path.join(DATA_DIR, "users.json");
-const CARTS_FILE = path.join(DATA_DIR, "carts.json");
-const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
 const PRODUCTS_FILE = path.join(DATA_DIR, "products.json");
-const REVIEWS_FILE = path.join(DATA_DIR, "reviews.json");
 const COUPONS_FILE = path.join(DATA_DIR, "coupons.json");
 // FIX: no built-in admin email. Admins come only from ADMIN_EMAILS or role "admin" in the database.
 // (Previously anyone could register "admin@protech.com" on a fresh database and become admin.)
@@ -63,7 +53,6 @@ const SALE_PRICES = {
   "smart-watch-pro": 224,
   "mechanical-keyboard": 104
 };
-let mailTransporterPromise = null;
 
 function resolveJwtSecret() {
   const configured = String(process.env.JWT_SECRET || "").trim();
@@ -143,7 +132,7 @@ app.use((req, res, next) => {
   const run = writeQueue.then(
     () =>
       new Promise((resolve) => {
-        const timer = setTimeout(resolve, 15000);
+        const timer = setTimeout(resolve, 30000);
         const done = () => {
           clearTimeout(timer);
           resolve();
@@ -315,58 +304,6 @@ function orderId() {
   return `ORD-${Date.now()}-${Math.floor(Math.random() * 9000) + 1000}`;
 }
 
-function canSendWelcomeEmail() {
-  return Boolean(SMTP_HOST && SMTP_PORT > 0 && SMTP_USER && SMTP_PASS && EMAIL_FROM);
-}
-
-async function getMailTransporter() {
-  if (!canSendWelcomeEmail()) {
-    return null;
-  }
-
-  if (!mailTransporterPromise) {
-    mailTransporterPromise = Promise.resolve(
-      nodemailer.createTransport({
-        host: SMTP_HOST,
-        port: SMTP_PORT,
-        secure: SMTP_SECURE,
-        auth: {
-          user: SMTP_USER,
-          pass: SMTP_PASS
-        }
-      })
-    );
-  }
-
-  return mailTransporterPromise;
-}
-
-async function sendWelcomeEmail(user) {
-  if (!canSendWelcomeEmail()) {
-    return false;
-  }
-
-  try {
-    const transporter = await getMailTransporter();
-
-    if (!transporter) {
-      return false;
-    }
-
-    await transporter.sendMail({
-      from: EMAIL_FROM,
-      to: user.email,
-      subject: "Welcome to ProTech",
-      text: `Hi ${user.name},\n\nYour ProTech account was created successfully.\n\nEmail: ${user.email}\n\nThanks for joining ProTech.`
-    });
-
-    return true;
-  } catch (error) {
-    console.error("Welcome email failed:", error?.message || error);
-    return false;
-  }
-}
-
 function buildPasswordResetToken() {
   const token = crypto.randomBytes(24).toString("hex");
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
@@ -376,59 +313,6 @@ function buildPasswordResetToken() {
     tokenHash,
     expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString()
   };
-}
-
-async function sendPasswordResetEmail(user, resetToken) {
-  if (!canSendWelcomeEmail()) {
-    return false;
-  }
-
-  try {
-    const transporter = await getMailTransporter();
-
-    if (!transporter) {
-      return false;
-    }
-
-    await transporter.sendMail({
-      from: EMAIL_FROM,
-      to: user.email,
-      subject: "ProTech password reset",
-      text: `Hi ${user.name || "there"},\n\nUse this reset token to set a new password:\n${resetToken}\n\nThis token expires in 30 minutes.\n\nIf you did not request this, you can ignore this email.`
-    });
-
-    return true;
-  } catch (error) {
-    console.error("Password reset email failed:", error?.message || error);
-    return false;
-  }
-}
-
-function datasetKeyFromPath(filePath) {
-  return path.basename(String(filePath || ""), ".json") || "dataset";
-}
-
-async function readJson(filePath, fallback) {
-  const datasetKey = datasetKeyFromPath(filePath);
-
-  const fromDb = await readDataset(datasetKey);
-
-  if (fromDb !== null) {
-    return fromDb;
-  }
-
-  try {
-    const raw = await fs.readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    await writeDataset(datasetKey, parsed);
-    return parsed;
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      await writeDataset(datasetKey, fallback);
-      return fallback;
-    }
-    throw error;
-  }
 }
 
 // FIX: products.json and coupons.json are the source of truth for the catalog, so editing those files
@@ -445,40 +329,29 @@ async function readCatalogFile(filePath, fallback) {
   }
 }
 
-async function writeJson(filePath, value) {
-  const datasetKey = datasetKeyFromPath(filePath);
-  await writeDataset(datasetKey, value);
-
-  // The JSON files stay as a mirror (used by scripts/generate-phpmyadmin-sql.js).
-  // FIX: write to a temp file and rename, so a crash mid-write cannot leave a half-written file.
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.tmp`;
-  await fs.writeFile(tempPath, JSON.stringify(value, null, 2) + "\n", "utf8");
-  await fs.rename(tempPath, filePath);
-}
-
+// Users, carts, orders and reviews are saved by ./store (MySQL, or local files when MySQL isn't set up).
 async function readUsers() {
-  return readJson(USERS_FILE, []);
+  return store.readUsers();
 }
 
 async function writeUsers(users) {
-  await writeJson(USERS_FILE, users);
+  await store.writeUsers(users);
 }
 
 async function readCarts() {
-  return readJson(CARTS_FILE, {});
+  return store.readCarts();
 }
 
 async function writeCarts(carts) {
-  await writeJson(CARTS_FILE, carts);
+  await store.writeCarts(carts);
 }
 
 async function readOrders() {
-  return readJson(ORDERS_FILE, []);
+  return store.readOrders();
 }
 
 async function writeOrders(orders) {
-  await writeJson(ORDERS_FILE, orders);
+  await store.writeOrders(orders);
 }
 
 const DEFAULT_PRODUCTS = [
@@ -680,11 +553,11 @@ function priceItemsFromCatalog(rawItems, catalog) {
 }
 
 async function readReviews() {
-  return readJson(REVIEWS_FILE, []);
+  return store.readReviews();
 }
 
 async function writeReviews(reviews) {
-  await writeJson(REVIEWS_FILE, reviews);
+  await store.writeReviews(reviews);
 }
 
 async function readCoupons() {
@@ -842,12 +715,17 @@ function calculateTotal(items) {
 }
 
 async function getCurrentUserById(userId) {
-  const users = await readUsers();
-  return users.find((user) => user.id === userId) || null;
+  return store.findUserById(userId);
 }
 
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", service: "protech-backend", date: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    service: "protech-backend",
+    date: new Date().toISOString(),
+    database: store.kind,
+    email: mailer.isConfigured() ? "configured" : "not configured"
+  });
 });
 
 app.get("/", (_req, res) => {
@@ -1074,7 +952,9 @@ const registerHandler = asyncHandler(async (req, res) => {
   users.push(user);
   await writeUsers(users);
 
-  const emailSent = await sendWelcomeEmail(user);
+  // FIX: the welcome email is sent in the background. Before, sign-up waited for the mail server,
+  // so a slow or blocked SMTP connection made sign-up look like it failed (the account was still created).
+  const emailSent = mailer.welcome(user);
 
   const token = signToken(user);
   res.status(201).json({ user: sanitizeUser(user), token, emailSent });
@@ -1129,6 +1009,7 @@ app.post("/api/auth/google", loginLimiter, asyncHandler(async (req, res) => {
 
       users.push(newUser);
       await writeUsers(users);
+      mailer.welcome(newUser);
 
       const token = signToken(newUser);
       return res.status(201).json({ user: sanitizeUser(newUser), token });
@@ -1210,7 +1091,8 @@ app.post("/api/auth/forgot-password", passwordResetLimiter, asyncHandler(async (
   users[userIndex].resetPasswordExpiresAt = generated.expiresAt;
   await writeUsers(users);
 
-  const emailSent = await sendPasswordResetEmail(users[userIndex], generated.token);
+  // Sent in the background: the answer is the same whether or not the account exists.
+  const emailSent = mailer.passwordReset(users[userIndex], generated.token);
 
   if (!emailSent) {
     console.warn("Password reset requested but SMTP is not configured, so no email was sent.");
@@ -1269,6 +1151,7 @@ app.post("/api/auth/reset-password", passwordResetLimiter, asyncHandler(async (r
   delete users[userIndex].resetPasswordTokenHash;
   delete users[userIndex].resetPasswordExpiresAt;
   await writeUsers(users);
+  mailer.passwordChanged(users[userIndex]);
 
   res.json({ message: "Password reset successfully. You can sign in now." });
 }));
@@ -1373,6 +1256,7 @@ app.put("/api/profile/password", authRequired, async (req, res) => {
 
   users[userIndex].passwordHash = await bcrypt.hash(newPassword, 10);
   await writeUsers(users);
+  mailer.passwordChanged(users[userIndex]);
 
   res.json({ message: "Password updated successfully." });
 });
@@ -1519,6 +1403,9 @@ app.post("/api/orders", authRequired, async (req, res) => {
   carts[req.auth.userId] = [];
   await writeCarts(carts);
 
+  mailer.orderConfirmation(order);
+  mailer.newOrderAlert(order);
+
   res.status(201).json({ order });
 });
 
@@ -1559,6 +1446,9 @@ app.post("/api/orders/:orderId/reorder", authRequired, async (req, res) => {
   orders.unshift(newOrder);
   await writeOrders(orders);
 
+  mailer.orderConfirmation(newOrder);
+  mailer.newOrderAlert(newOrder);
+
   res.status(201).json({ order: newOrder });
 });
 
@@ -1595,7 +1485,13 @@ app.patch("/api/admin/orders/:orderId/status", authRequired, requirePermission("
   };
 
   await writeOrders(orders);
-  res.json({ order: orders[orderIndex] });
+
+  // Tell the customer when the status really changes (only if "notify" isn't turned off).
+  const notify = req.body?.notify !== false;
+  const changed = String(currentOrder.status || "pending").toLowerCase() !== nextStatus;
+  const emailSent = notify && changed ? mailer.orderStatus(orders[orderIndex]) : false;
+
+  res.json({ order: orders[orderIndex], emailSent });
 });
 
 // ---------- Customers and team (admin panel) ----------
@@ -1698,6 +1594,27 @@ app.patch("/api/admin/team/:userId", authRequired, requirePermission(TEAM_PERMIS
   return changeAccess(req, res, (user) => user.id === userId);
 });
 
+// Super admins: check that email works (Team tab -> "Send test email").
+app.get("/api/admin/email-status", authRequired, requirePermission(TEAM_PERMISSION), async (_req, res) => {
+  res.json({ email: mailer.status(), database: store.kind });
+});
+
+app.post("/api/admin/test-email", authRequired, requirePermission(TEAM_PERMISSION), async (req, res) => {
+  const to = normalizeEmail(req.body?.to) || normalizeEmail(req.admin.email);
+
+  if (!isValidEmail(to)) {
+    return res.status(400).json({ message: "Please provide a valid email." });
+  }
+
+  const result = await mailer.testEmail(to);
+
+  if (!result.sent) {
+    return res.status(502).json({ message: result.error, email: mailer.status() });
+  }
+
+  res.json({ message: `Test email sent to ${to}. Check the inbox (and the spam folder).`, email: mailer.status() });
+});
+
 app.use((req, res) => {
   res.status(404).json({ message: `Route not found: ${req.method} ${req.path}` });
 });
@@ -1723,6 +1640,31 @@ process.on("unhandledRejection", (reason) => {
   console.error("Unhandled promise rejection:", reason);
 });
 
-app.listen(PORT, () => {
-  console.log(`ProTech backend listening on http://localhost:${PORT}`);
-});
+async function start() {
+  try {
+    await store.init();
+  } catch (error) {
+    console.error(`FATAL: could not open the database: ${error.message}`);
+    process.exit(1);
+  }
+
+  // Keep a copy of the catalog in MySQL (products.json / coupons.json stay the source of truth).
+  try {
+    const [products, coupons] = await Promise.all([readProducts(), readCoupons()]);
+    await store.syncCatalog(products.map(normalizeProduct), coupons);
+  } catch (error) {
+    console.warn("Could not copy the catalog to the database:", error.message);
+  }
+
+  console.log(`Data is stored in: ${store.kind === "mysql" ? "MySQL" : "local files (backend/data)"}`);
+  if (store.kind !== "mysql" && IS_PRODUCTION) {
+    console.warn("WARNING: MYSQL_URL is not set. On Render's free plan local data is lost on every restart.");
+  }
+  mailer.verify().catch(() => {});
+
+  app.listen(PORT, () => {
+    console.log(`ProTech backend listening on http://localhost:${PORT}`);
+  });
+}
+
+start();
