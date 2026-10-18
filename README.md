@@ -8,14 +8,15 @@ Node/Express backend for your `protech` frontend.
 - Profile update + password change
 - Cart API (get, replace, add item, remove item, clear)
 - Orders API (list, create from cart/items, reorder)
-- JSON-file persistence in `data/`
+- MySQL storage (or local files in `data/` when no MySQL is set up)
+- Emails over SMTP: welcome, password reset link, order confirmation, order status updates
 
 ## Project structure
 
 - `src/server.js` - all API routes + middleware
-- `data/users.json` - users (with hashed passwords)
-- `data/carts.json` - cart items by user id
-- `data/orders.json` - placed orders
+- `src/store/` - where data is saved: `mysql.js` (MySQL tables) or `local.js` (`data/protech.db` + `data/*.json`)
+- `src/mailer.js` - all emails (texts and HTML templates)
+- `data/products.json`, `data/coupons.json` - the catalog (source of truth, also copied into MySQL)
 
 ## Setup
 
@@ -125,8 +126,11 @@ localStorage.setItem("protechApiBaseUrl", "https://your-backend-service.onrender
 3. Start command: `npm start`
 4. Required env vars:
 	- `JWT_SECRET` = random string, at least 32 characters (the server will not start on Render without it)
-	- `SMTP_*` + `EMAIL_FROM` if you want password reset to work (the reset token is only ever sent by email)
+	- `MYSQL_URL` (+ `MYSQL_SSL_CA`) so data survives restarts (see "Database" below)
+	- `SMTP_HOST`, `SMTP_PORT=2525`, `SMTP_USER`, `SMTP_PASS`, `EMAIL_FROM` for emails (see "Emails" below)
 5. Optional env vars:
+	- `FRONTEND_URL` (links in emails, default `https://protech.free.je`)
+	- `ORDER_NOTIFY_EMAIL` (get an email for every new order)
 	- `PORT` (Render provides this automatically)
 	- `GOOGLE_CLIENT_ID` (if you use Google login)
 	- `SUPER_ADMIN_EMAILS` (comma-separated; super admins can add, change and remove admins from the admin panel)
@@ -167,3 +171,26 @@ $me = Invoke-RestMethod -Method Get -Uri 'http://localhost:4000/api/auth/me' -He
 - Nobody can change their own access. Changes apply immediately (no need to sign in again).
 - API: `GET /api/admin/users`, `POST /api/admin/team` `{ email, accessLevel, permissions }`, `PATCH /api/admin/team/:userId` `{ accessLevel, permissions }`.
   `accessLevel` is `none`, `limited`, `full` or `super`; `permissions` (for limited) is any of `orders.view`, `orders.update`, `customers.view`.
+
+## Database (MySQL)
+
+- Set `MYSQL_URL=mysql://USER:PASSWORD@HOST:PORT/DATABASE` (Aiven's "Service URI" works as is) and, for cloud databases, `MYSQL_SSL_CA` (the CA certificate text) or `MYSQL_SSL_CA_FILE` (a path, e.g. a Render Secret File `/etc/secrets/ca.pem`).
+- On start the server creates the tables (`users`, `orders`, `order_items`, `carts`, `cart_items`, `reviews`, `products`, `coupons`, `protech_meta`) and adds any missing columns to tables created earlier with `protech_phpmyadmin_import.sql`.
+- If the `users` table is empty the first time, the existing local data (`data/protech.db` / `data/*.json`) is copied in once.
+- `products` and `coupons` tables are a copy of `data/products.json` / `data/coupons.json`, refreshed on every start. Edit the JSON files to change the catalog.
+- Without `MYSQL_URL` the server uses local files, which is fine on your own computer. `GET /api/health` shows `"database": "mysql"` or `"local"`.
+
+## Emails
+
+| Email | When |
+|---|---|
+| Welcome | A new account is created (also with Google) |
+| Password reset | "Forgot password?" - contains a link that opens the reset form with the code filled in (valid 30 minutes) |
+| Password changed | After a reset or a change on the profile page |
+| Order confirmed | An order is placed (also "Order again") |
+| Order status | An admin changes the status (pending, processing, shipped, delivered, cancelled) |
+| New order alert | Every new order, to `ORDER_NOTIFY_EMAIL` (optional) |
+
+- Emails are sent in the background, so a slow or broken mail server never slows down or breaks sign-up or checkout.
+- Super admins can check the settings and send a test email in the admin panel: Team tab -> Emails. API: `GET /api/admin/email-status`, `POST /api/admin/test-email` `{ to }`.
+- Render's free plan blocks the usual SMTP ports (25, 465, 587). Brevo's `smtp-relay.brevo.com` on port **2525** works.
